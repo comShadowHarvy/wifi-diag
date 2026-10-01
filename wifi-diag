@@ -2,21 +2,25 @@
 """
 wifi-diag - Comprehensive Wi-Fi Diagnostic and Status Tool for Linux.
 Provides detailed information on SSID, Frequency, Band, Channel, Signal Strength,
-Bitrate/Speed, Throughput, Security, Hardware, IP/Routing, and Packet Statistics.
+Bitrate/Speed, Throughput, Security, Hardware, IP/Routing, Packet Statistics,
+Channel Congestion Advisor, Mesh/Roaming Monitor, Jitter Stress Testing,
+and Real-time Walk-test Logging.
 """
 
 import sys
 import os
 import re
+import csv
 import time
 import json
 import socket
 import argparse
 import subprocess
 import threading
+from collections import defaultdict, deque
 from typing import Dict, Any, List, Optional, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ANSI Colors
 COLOR_RESET = "\033[0m"
@@ -29,6 +33,8 @@ COLOR_RED = "\033[31m"
 COLOR_BLUE = "\033[34m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_WHITE = "\033[37m"
+
+SPARK_CHARS = " ▂▃▄▅▆▇█"
 
 
 def run_cmd(cmd: str, timeout: float = 3.0) -> str:
@@ -103,7 +109,7 @@ def signal_quality_rating(dbm: Optional[int]) -> Tuple[str, str]:
     return ("Very Poor", COLOR_RED)
 
 
-def make_meter_bar(percent: int, length: int = 22, use_color: bool = True) -> str:
+def make_meter_bar(percent: int, length: int = 24, use_color: bool = True) -> str:
     """Creates a visual progress/meter bar [██████░░░░]."""
     percent = max(0, min(100, percent))
     filled = int(round((percent / 100.0) * length))
@@ -122,6 +128,25 @@ def make_meter_bar(percent: int, length: int = 22, use_color: bool = True) -> st
         c = COLOR_RED
 
     return f"{c}[{'█' * filled}{COLOR_DIM}{'░' * empty}{COLOR_RESET}{c}]{COLOR_RESET}"
+
+
+def make_sparkline(values: List[float], min_val: Optional[float] = None, max_val: Optional[float] = None) -> str:
+    """Generates an ASCII sparkline representation of rolling numerical values."""
+    if not values:
+        return ""
+    if min_val is None:
+        min_val = min(values)
+    if max_val is None:
+        max_val = max(values)
+    span = max_val - min_val
+    if span <= 0.001:
+        return SPARK_CHARS[4] * len(values)
+    res = []
+    for v in values:
+        clamped = max(min_val, min(max_val, v))
+        idx = int(round(((clamped - min_val) / span) * (len(SPARK_CHARS) - 1)))
+        res.append(SPARK_CHARS[idx])
+    return "".join(res)
 
 
 def format_bitrate_details(raw: Optional[str]) -> str:
@@ -166,7 +191,6 @@ def detect_wireless_interfaces() -> List[str]:
                 interfaces.append(iface)
 
     if not interfaces:
-        # Fallback to iw dev
         iw_out = run_cmd("iw dev")
         for match in re.finditer(r"Interface\s+([a-zA-Z0-9_\-]+)", iw_out):
             interfaces.append(match.group(1))
@@ -182,13 +206,11 @@ def choose_best_interface(preferred_iface: Optional[str] = None) -> Optional[str
     if preferred_iface:
         return preferred_iface
 
-    # Look for one connected via iw
     for iface in interfaces:
         out = run_cmd(f"iw dev {iface} link")
         if "Connected to" in out:
             return iface
 
-    # Look for one that is UP
     for iface in interfaces:
         operstate_path = f"/sys/class/net/{iface}/operstate"
         if os.path.exists(operstate_path):
@@ -256,7 +278,6 @@ def get_hardware_info(iface: str) -> Dict[str, Any]:
         "pci_slot": None,
     }
 
-    # MAC Address
     mac_path = f"/sys/class/net/{iface}/address"
     if os.path.exists(mac_path):
         try:
@@ -265,7 +286,6 @@ def get_hardware_info(iface: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Sysfs uevent
     uevent_path = f"/sys/class/net/{iface}/device/uevent"
     pci_slot = None
     if os.path.exists(uevent_path):
@@ -280,7 +300,6 @@ def get_hardware_info(iface: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Ethtool info
     ethtool_out = run_cmd(f"ethtool -i {iface}")
     for line in ethtool_out.splitlines():
         if line.startswith("driver:"):
@@ -290,12 +309,9 @@ def get_hardware_info(iface: str) -> Dict[str, Any]:
         elif line.startswith("firmware-version:"):
             info["firmware"] = line.split(":", 1)[1].strip()
 
-    # LSPCI device description
     if pci_slot:
         lspci_out = run_cmd(f"lspci -s {pci_slot}")
         if ":" in lspci_out:
-            # Format: "0000:03:00.0 Network controller: Realtek Semiconductor Co., Ltd. RTL8852BE..."
-            # Extract portion after last colon or after controller description
             clean_name = lspci_out.split(":")[-1].strip()
             if clean_name:
                 info["device_name"] = clean_name
@@ -313,7 +329,6 @@ def get_ip_info(iface: str) -> Dict[str, Any]:
         "dns_servers": [],
     }
 
-    # IP addresses via ip -j or ip addr
     ip_out = run_cmd(f"ip -j addr show {iface}")
     if ip_out.startswith("["):
         try:
@@ -339,13 +354,11 @@ def get_ip_info(iface: str) -> Dict[str, Any]:
         if m_v6:
             net_info["ipv6_global"] = m_v6.group(1)
 
-    # Gateway
     route_out = run_cmd(f"ip route show default dev {iface}")
     m_gw = re.search(r"via\s+([0-9\.]+)", route_out)
     if m_gw:
         net_info["gateway"] = m_gw.group(1)
 
-    # DNS from resolvectl or nmcli
     dns_found = []
     resolve_out = run_cmd(f"resolvectl dns {iface}")
     if "DNS Servers:" in resolve_out:
@@ -393,6 +406,128 @@ def ping_host(host: str, count: int = 1, timeout: float = 1.0) -> Optional[float
         except ValueError:
             return None
     return None
+
+
+def run_burst_jitter_test(target: str, count: int = 15) -> Dict[str, Any]:
+    """Executes a rapid ping burst to measure latency distribution, jitter, and packet loss."""
+    cmd = f"ping -c {count} -i 0.2 -W 1 {target}"
+    proc = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out = proc.stdout
+
+    m_loss = re.search(r"(\d+)% packet loss", out)
+    loss = float(m_loss.group(1)) if m_loss else 100.0
+
+    m_rtt = re.search(r"rtt min/avg/max/mdev = ([0-9\.]+)/([0-9\.]+)/([0-9\.]+)/([0-9\.]+)\s*ms", out)
+    if m_rtt:
+        min_ms = float(m_rtt.group(1))
+        avg_ms = float(m_rtt.group(2))
+        max_ms = float(m_rtt.group(3))
+        jitter_ms = float(m_rtt.group(4))
+
+        if jitter_ms < 3.0 and loss == 0:
+            grade = "A+ (Ultra Stable)"
+        elif jitter_ms < 8.0 and loss == 0:
+            grade = "A (Excellent)"
+        elif jitter_ms < 15.0 and loss <= 1.0:
+            grade = "B (Good)"
+        elif jitter_ms < 30.0 or loss <= 3.0:
+            grade = "C (Moderate Jitter)"
+        else:
+            grade = "D (Poor Stability)"
+
+        return {
+            "target": target,
+            "success": True,
+            "packets_sent": count,
+            "loss_pct": loss,
+            "min_ms": min_ms,
+            "avg_ms": avg_ms,
+            "max_ms": max_ms,
+            "jitter_ms": jitter_ms,
+            "grade": grade,
+        }
+
+    return {"target": target, "success": False, "loss_pct": loss, "grade": "F (Failed)"}
+
+
+def calculate_health_score(data: Dict[str, Any]) -> Tuple[int, str, List[str]]:
+    """Calculates an overall Wi-Fi connection health score (0-100) and actionable tips."""
+    if not data["connected"]:
+        return (0, "Disconnected", ["Interface is not connected to any network."])
+
+    score = 100
+    tips = []
+
+    # 1. Signal level (up to 40 pts)
+    sig = data["signal"].get("level_dbm")
+    if sig is not None:
+        if sig >= -55:
+            tips.append(f"Signal strength is excellent ({sig} dBm) with minimal attenuation.")
+        elif sig >= -66:
+            score -= 6
+            tips.append(f"Signal strength is good ({sig} dBm).")
+        elif sig >= -76:
+            score -= 16
+            tips.append(f"Signal is fair ({sig} dBm). Moving closer to router could improve throughput.")
+        elif sig >= -85:
+            score -= 28
+            tips.append(f"Signal is weak ({sig} dBm). Expect packet loss and lower bitrate.")
+        else:
+            score -= 42
+            tips.append(f"Signal is critically weak ({sig} dBm). High risk of disconnection.")
+    else:
+        score -= 20
+
+    # 2. Gateway Latency (up to 25 pts)
+    gw_lat = data["latency"].get("gateway_ms")
+    if gw_lat is not None:
+        if gw_lat < 12.0:
+            tips.append(f"Local Wi-Fi response time to router is crisp ({gw_lat:.1f} ms).")
+        elif gw_lat < 25.0:
+            score -= 5
+            tips.append(f"Gateway latency is acceptable ({gw_lat:.1f} ms).")
+        elif gw_lat < 50.0:
+            score -= 14
+            tips.append(f"Gateway latency is elevated ({gw_lat:.1f} ms). Check for interference.")
+        else:
+            score -= 24
+            tips.append(f"High local latency ({gw_lat:.1f} ms) indicates Wi-Fi congestion or bufferbloat.")
+    elif data["network"].get("gateway"):
+        score -= 10
+        tips.append("Gateway ping timed out or ICMP is filtered.")
+
+    # 3. Frequency Band & Channel Width (up to 20 pts)
+    band = data["radio"].get("band")
+    width = data["radio"].get("channel_width_mhz")
+    if band in ["5 GHz", "6 GHz"]:
+        if width and width >= 80:
+            tips.append(f"High-bandwidth {band} connection ({width} MHz channel width).")
+        else:
+            score -= 4
+    elif band == "2.4 GHz":
+        score -= 12
+        tips.append("Connected on 2.4 GHz band. 5 GHz / 6 GHz will provide higher throughput if in range.")
+
+    # 4. Error Rates (up to 15 pts)
+    failed = data["stats"].get("tx_failed") or 0
+    retries = data["stats"].get("tx_retries") or 0
+    drops = data["stats"].get("rx_drops") or 0
+    if failed > 50 or drops > 1000:
+        score -= 8
+        tips.append(f"Elevated frame drops ({failed} failed, {drops} rx drops).")
+
+    score = max(0, min(100, score))
+
+    if score >= 90:
+        rating = "Optimal Connection"
+    elif score >= 75:
+        rating = "Good Connection"
+    elif score >= 60:
+        rating = "Fair Connection"
+    else:
+        rating = "Poor / Degraded"
+
+    return (score, rating, tips)
 
 
 def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
@@ -447,13 +582,16 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
             "gateway_ms": None,
             "internet_ms": None,
         },
+        "health": {
+            "score": 0,
+            "rating": "Unknown",
+            "tips": [],
+        },
     }
 
-    # 1. Hardware & IP Info
     data["hardware"] = get_hardware_info(iface)
     data["network"] = get_ip_info(iface)
 
-    # Concurrent ping if requested and gateway available
     ping_threads = []
     if run_pings:
         gw = data["network"].get("gateway")
@@ -470,7 +608,6 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
         t_net.start()
         ping_threads.append(t_net)
 
-    # 2. Query iw dev <iface> link
     link_out = run_cmd(f"iw dev {iface} link")
     if "Connected to" in link_out:
         data["connected"] = True
@@ -520,7 +657,6 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
             data["stats"]["tx_bytes"] = int(m_tx_bytes.group(1))
             data["stats"]["tx_packets"] = int(m_tx_bytes.group(2))
 
-    # 3. Query iw dev <iface> info
     info_out = run_cmd(f"iw dev {iface} info")
     m_type = re.search(r"type\s+(\w+)", info_out)
     if m_type:
@@ -543,7 +679,6 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
     if m_txp:
         data["radio"]["tx_power_dbm"] = float(m_txp.group(1))
 
-    # 4. Query iw dev <iface> station dump
     station_out = run_cmd(f"iw dev {iface} station dump")
     if station_out:
         m_sig_avg = re.search(r"signal avg:\s*(-?\d+)", station_out)
@@ -579,7 +714,6 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
         if m_beacon:
             data["stats"]["beacon_loss"] = int(m_beacon.group(1))
 
-        # Bitrates if link didn't catch them
         if not data["speed"]["tx_bitrate"]:
             m_st_tx = re.search(r"tx bitrate:\s*(.+)", station_out)
             if m_st_tx:
@@ -591,12 +725,10 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
                 data["speed"]["rx_bitrate"] = m_st_rx.group(1).strip()
                 data["speed"]["rx_bitrate_formatted"] = format_bitrate_details(data["speed"]["rx_bitrate"])
 
-    # 5. Cross-reference with nmcli for security, bars, and AP max rate
     nm_active = run_cmd(
         "nmcli -t -f active,ssid,bssid,mode,chan,freq,rate,signal,bars,security dev wifi"
     )
     for line in nm_active.splitlines():
-        # nmcli -t escapes colons in fields like BSSID (\:)
         parts = re.split(r"(?<!\\):", line)
         if len(parts) >= 10:
             is_active = parts[0].strip().lower() == "yes"
@@ -619,13 +751,11 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
                 if data["signal"]["level_dbm"] is None and parts[7].isdigit():
                     data["signal"]["level_dbm"] = int(int(parts[7]) / 2 - 100)
 
-    # 6. Fill in Band and Channel if not already resolved
     band, ch = freq_to_band_and_channel(data["radio"]["frequency_mhz"])
     data["radio"]["band"] = band
     if data["radio"]["channel"] is None:
         data["radio"]["channel"] = ch
 
-    # Channel width extraction from bitrate string if not yet found
     if data["radio"]["channel_width_mhz"] is None:
         for r_str in [data["speed"]["rx_bitrate"], data["speed"]["tx_bitrate"]]:
             if r_str:
@@ -634,7 +764,6 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
                     data["radio"]["channel_width_mhz"] = int(m_cw.group(1))
                     break
 
-    # Standard / Generation calculation
     search_str = " ".join(
         filter(
             None,
@@ -647,15 +776,18 @@ def collect_wifi_status(iface: str, run_pings: bool = True) -> Dict[str, Any]:
     )
     data["standard"] = determine_wifi_generation(search_str)
 
-    # Signal Rating and Percentage
     sig_dbm = data["signal"]["level_dbm"]
     data["signal"]["quality_percent"] = dbm_to_percent(sig_dbm)
     rating, _ = signal_quality_rating(sig_dbm)
     data["signal"]["rating"] = rating
 
-    # Wait for pings to finish
     for t in ping_threads:
         t.join(timeout=1.5)
+
+    score, health_rating, tips = calculate_health_score(data)
+    data["health"]["score"] = score
+    data["health"]["rating"] = health_rating
+    data["health"]["tips"] = tips
 
     return data
 
@@ -680,12 +812,25 @@ def scan_wifi_networks(iface: str) -> List[Dict[str, Any]]:
             bars = parts[8]
             sec = parts[9] if len(parts) > 9 else ""
 
+            # Determine band
+            m_f = re.search(r"(\d+)", freq)
+            band = "Unknown"
+            if m_f:
+                f_int = int(m_f.group(1))
+                if 2400 <= f_int <= 2500:
+                    band = "2.4 GHz"
+                elif 5150 <= f_int <= 5895:
+                    band = "5 GHz"
+                elif 5925 <= f_int <= 7125:
+                    band = "6 GHz"
+
             networks.append(
                 {
                     "in_use": in_use,
                     "bssid": bssid,
                     "ssid": ssid if ssid else "<Hidden>",
                     "mode": mode,
+                    "band": band,
                     "channel": chan,
                     "freq": freq,
                     "rate": rate,
@@ -697,6 +842,251 @@ def scan_wifi_networks(iface: str) -> List[Dict[str, Any]]:
 
     networks.sort(key=lambda x: (x["in_use"], x["signal"]), reverse=True)
     return networks
+
+
+def get_mesh_nodes(ssid: str, current_bssid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Discovers all AP nodes belonging to the current SSID and compares signal levels."""
+    all_networks = scan_wifi_networks("wlan0")
+    matching = [n for n in all_networks if n["ssid"] == ssid]
+
+    curr_sig = 0
+    if current_bssid:
+        for n in matching:
+            if n["bssid"] == current_bssid:
+                curr_sig = n["signal"]
+                break
+
+    for n in matching:
+        delta = n["signal"] - curr_sig
+        n["delta_pct"] = delta
+        n["is_current"] = (current_bssid is not None and n["bssid"] == current_bssid)
+
+    matching.sort(key=lambda x: (x["is_current"], x["signal"]), reverse=True)
+    return matching
+
+
+def print_mesh_table(ssid: str, current_bssid: Optional[str], use_color: bool = True) -> None:
+    """Renders a clean comparison table of mesh / multi-AP nodes."""
+    c_b = COLOR_BOLD if use_color else ""
+    c_c = COLOR_CYAN if use_color else ""
+    c_g = COLOR_GREEN if use_color else ""
+    c_y = COLOR_YELLOW if use_color else ""
+    c_r = COLOR_RED if use_color else ""
+    c_dim = COLOR_DIM if use_color else ""
+    c_reset = COLOR_RESET if use_color else ""
+
+    nodes = get_mesh_nodes(ssid, current_bssid)
+    print(f"\n{c_b}{c_c}Mesh & Multi-AP Nodes for SSID '{ssid}' ({len(nodes)} nodes detected):{c_reset}\n")
+
+    if not nodes:
+        print(f"  {c_dim}No access points found broadcasting SSID '{ssid}'.{c_reset}\n")
+        return
+
+    header = f"{'STATE':<13} {'BSSID':<19} {'BAND':<9} {'CHAN':<6} {'FREQ':<10} {'SIGNAL':<13} {'DELTA':<10} {'NOTES'}"
+    print(f"{c_b}{header}{c_reset}")
+    print(f"{c_dim}{'─' * len(header)}{c_reset}")
+
+    for n in nodes:
+        if n["is_current"]:
+            plain_state = "[CONNECTED]"
+            state_str = f"{c_g}{plain_state:<13}{c_reset}"
+            plain_delta = "Active"
+            delta_str = f"{plain_delta:<10}"
+            notes = f"{c_g}Current Connected Node{c_reset}"
+        else:
+            plain_state = "[AVAILABLE]"
+            state_str = f"{c_dim}{plain_state:<13}{c_reset}"
+            d = n["delta_pct"]
+            if d > 0:
+                plain_delta = f"+{d}%"
+                delta_str = f"{c_g}{plain_delta:<10}{c_reset}"
+                notes = f"{c_g}Stronger Node Available!{c_reset}" if d >= 10 else "Nearby node"
+            elif d < 0:
+                plain_delta = f"{d}%"
+                delta_str = f"{c_dim}{plain_delta:<10}{c_reset}"
+                notes = f"{c_dim}Weaker node{c_reset}"
+            else:
+                plain_delta = "Equal"
+                delta_str = f"{plain_delta:<10}"
+                notes = "Equal signal"
+
+        sig = n["signal"]
+        sig_col = c_g if sig >= 70 else (c_y if sig >= 40 else c_r)
+        plain_sig = f"{n['bars']} {sig:>3}%"
+        sig_meter = f"{sig_col}{plain_sig:<13}{c_reset}"
+
+        print(
+            f"{state_str} {n['bssid']:<19} {n['band']:<9} {n['channel']:<6} "
+            f"{n['freq']:<10} {sig_meter} {delta_str} {notes}"
+        )
+    print()
+
+
+def print_channel_advisor(current_band: Optional[str] = None, current_chan: Optional[int] = None, use_color: bool = True) -> None:
+    """Analyzes RF channel congestion across bands and suggests optimal channels."""
+    c_b = COLOR_BOLD if use_color else ""
+    c_c = COLOR_CYAN if use_color else ""
+    c_g = COLOR_GREEN if use_color else ""
+    c_y = COLOR_YELLOW if use_color else ""
+    c_r = COLOR_RED if use_color else ""
+    c_dim = COLOR_DIM if use_color else ""
+    c_reset = COLOR_RESET if use_color else ""
+
+    networks = scan_wifi_networks("wlan0")
+    band_channels: Dict[str, Dict[int, List[Dict[str, Any]]]] = {
+        "2.4 GHz": defaultdict(list),
+        "5 GHz": defaultdict(list),
+        "6 GHz": defaultdict(list),
+    }
+
+    for n in networks:
+        band = n.get("band")
+        ch_str = str(n.get("channel", ""))
+        if band in band_channels and ch_str.isdigit():
+            band_channels[band][int(ch_str)].append(n)
+
+    print(f"\n{c_b}{c_c}╔══════════════════════════════════════════════════════════════════════════════════╗{c_reset}")
+    print(f"{c_b}{c_c}║{c_WHITE if 'c_WHITE' in locals() else COLOR_WHITE} Wi-Fi Channel Congestion & Interference Advisor                                ║{c_reset}")
+    print(f"{c_b}{c_c}╚══════════════════════════════════════════════════════════════════════════════════╝{c_reset}\n")
+
+    # Analyze 2.4 GHz (Standard non-overlapping: 1, 6, 11)
+    print(f"  {c_b}2.4 GHz Band Distribution:{c_reset}")
+    ch_24 = band_channels["2.4 GHz"]
+    cleanest_24 = None
+    min_count_24 = 9999
+
+    for ch in sorted(ch_24.keys()):
+        count = len(ch_24[ch])
+        is_cur = (current_band == "2.4 GHz" and current_chan == ch)
+        cur_mark = f"{c_g} [CURRENT]{c_reset}" if is_cur else ""
+
+        # Rating
+        if count <= 2:
+            status = f"{c_g}Clean / Low Traffic{c_reset}"
+        elif count <= 5:
+            status = f"{c_y}Moderate{c_reset}"
+        else:
+            status = f"{c_r}Crowded ({count} APs){c_reset}"
+
+        bar = "█" * min(15, count)
+        print(f"    Channel {ch:>2} : {bar:<15} {status}{cur_mark}")
+
+        if ch in [1, 6, 11] and count < min_count_24:
+            min_count_24 = count
+            cleanest_24 = ch
+
+    if cleanest_24:
+        print(f"    {c_c}↳ Recommendation:{c_reset} Best non-overlapping 2.4 GHz channel: {c_b}Channel {cleanest_24}{c_reset}\n")
+    else:
+        print(f"    {c_c}↳ Recommendation:{c_reset} Standard non-overlapping channels: {c_b}1, 6, 11{c_reset}\n")
+
+    # Analyze 5 GHz (UNII-1: 36-48, UNII-2: 52-64, UNII-2e: 100-144, UNII-3: 149-165)
+    print(f"  {c_b}5 GHz Band Distribution:{c_reset}")
+    ch_5 = band_channels["5 GHz"]
+    clean_candidates_5 = []
+
+    for ch in sorted(ch_5.keys()):
+        count = len(ch_5[ch])
+        is_cur = (current_band == "5 GHz" and current_chan == ch)
+        cur_mark = f"{c_g} [CURRENT]{c_reset}" if is_cur else ""
+
+        if count <= 2:
+            status = f"{c_g}Clean ({count} APs){c_reset}"
+            clean_candidates_5.append(ch)
+        elif count <= 6:
+            status = f"{c_y}Moderate ({count} APs){c_reset}"
+        else:
+            status = f"{c_r}Crowded ({count} APs){c_reset}"
+
+        bar = "█" * min(20, count)
+        print(f"    Channel {ch:>3} : {bar:<20} {status}{cur_mark}")
+
+    rec_ch_5 = clean_candidates_5[0] if clean_candidates_5 else (36 if 36 not in ch_5 else 44)
+    print(f"    {c_c}↳ Recommendation:{c_reset} Consider UNII-1/2 Channels (e.g. {c_b}Channel {rec_ch_5}{c_reset}) for less interference.\n")
+
+
+def print_jitter_test(gateway: Optional[str], use_color: bool = True) -> None:
+    """Runs a rapid ping burst to measure connection jitter, packet loss, and bufferbloat."""
+    c_b = COLOR_BOLD if use_color else ""
+    c_c = COLOR_CYAN if use_color else ""
+    c_g = COLOR_GREEN if use_color else ""
+    c_y = COLOR_YELLOW if use_color else ""
+    c_r = COLOR_RED if use_color else ""
+    c_dim = COLOR_DIM if use_color else ""
+    c_reset = COLOR_RESET if use_color else ""
+
+    print(f"\n{c_b}{c_c}Running Wi-Fi Jitter & Connection Stability Test (15 packets)...{c_reset}")
+
+    targets = []
+    if gateway:
+        targets.append(("Local Gateway (Router)", gateway))
+    targets.append(("Internet DNS (Cloudflare)", "1.1.1.1"))
+
+    print(f"\n{'TARGET':<28} {'MIN':<9} {'AVG':<9} {'MAX':<9} {'JITTER (mdev)':<15} {'LOSS':<8} {'GRADE'}")
+    print(f"{c_dim}{'─' * 94}{c_reset}")
+
+    for label, ip in targets:
+        res = run_burst_jitter_test(ip, count=10)
+
+        if res["success"]:
+            loss_col = c_g if res["loss_pct"] == 0 else (c_y if res["loss_pct"] <= 2 else c_r)
+            jit_col = c_g if res["jitter_ms"] < 5 else (c_y if res["jitter_ms"] < 15 else c_r)
+            loss_str = f"{loss_col}{res['loss_pct']:.0f}%{c_reset}"
+            jit_str = f"{jit_col}±{res['jitter_ms']:.2f} ms{c_reset}"
+            row = (
+                f"{label:<28} {res['min_ms']:>6.1f} ms {res['avg_ms']:>6.1f} ms "
+                f"{res['max_ms']:>6.1f} ms {jit_str:<24} {loss_str:<17} {c_b}{res['grade']}{c_reset}"
+            )
+            print(row)
+        else:
+            print(f"{label:<28} {c_r}Ping failed or host unreachable (100% loss){c_reset}")
+    print()
+
+
+def append_csv_log(filepath: str, data: Dict[str, Any]) -> None:
+    """Appends current Wi-Fi snapshot record to a CSV file for site-survey logging."""
+    file_exists = os.path.exists(filepath)
+    with open(filepath, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "Timestamp",
+                "Interface",
+                "SSID",
+                "BSSID",
+                "Band",
+                "Channel",
+                "Frequency_MHz",
+                "Width_MHz",
+                "Signal_dBm",
+                "Signal_Percent",
+                "Rating",
+                "RX_Mbps",
+                "TX_Mbps",
+                "Gateway_IP",
+                "Gateway_Latency_ms",
+                "Internet_Latency_ms",
+                "Health_Score",
+            ])
+        writer.writerow([
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            data.get("interface", ""),
+            data.get("ssid", ""),
+            data.get("bssid", ""),
+            data["radio"].get("band", ""),
+            data["radio"].get("channel", ""),
+            data["radio"].get("frequency_mhz", ""),
+            data["radio"].get("channel_width_mhz", ""),
+            data["signal"].get("level_dbm", ""),
+            data["signal"].get("quality_percent", ""),
+            data["signal"].get("rating", ""),
+            data["speed"].get("rx_bitrate_mbps", ""),
+            data["speed"].get("tx_bitrate_mbps", ""),
+            data["network"].get("gateway", ""),
+            data["latency"].get("gateway_ms", ""),
+            data["latency"].get("internet_ms", ""),
+            data["health"].get("score", ""),
+        ])
 
 
 def print_dashboard(data: Dict[str, Any], use_color: bool = True) -> None:
@@ -713,7 +1103,6 @@ def print_dashboard(data: Dict[str, Any], use_color: bool = True) -> None:
     iface = data["interface"]
     connected = data["connected"]
 
-    # Header
     raw_hw = data["hardware"].get("device_name") or data["hardware"].get("driver") or "Wireless Adapter"
     hw_clean = re.sub(r"Semiconductor Co\., Ltd\.\s*", "", raw_hw)
     header_title = f" Wi-Fi Diagnostic & Status  ──  {iface} ({hw_clean})"
@@ -797,7 +1186,18 @@ def print_dashboard(data: Dict[str, Any], use_color: bool = True) -> None:
     print(f"  {c_b}│{c_reset}  DNS Server(s)   : {dns_str}")
     print(f"  {c_b}│{c_reset}  Internet Latency: {net_lat_str} (Cloudflare 1.1.1.1)")
 
-    # Section 6: Statistics
+    # Section 6: Health Score & Diagnostic Recommendations
+    print(f"  {c_b}{c_c}├── Connection Health & Score ───────────────────────────────────────────────────┤{c_reset}")
+    hlth = data["health"]
+    sc = hlth["score"]
+    sc_col = c_g if sc >= 85 else (c_y if sc >= 65 else c_r)
+    print(f"  {c_b}│{c_reset}  Health Score    : {sc_col}{c_b}{sc}/100{c_reset} [{sc_col}{hlth['rating']}{c_reset}]")
+    if hlth["tips"]:
+        print(f"  {c_b}│{c_reset}  Diagnostic Tips :")
+        for tip in hlth["tips"]:
+            print(f"  {c_b}│{c_reset}    • {tip}")
+
+    # Section 7: Statistics
     print(f"  {c_b}{c_c}├── Traffic & Reliability ───────────────────────────────────────────────────────┤{c_reset}")
     st = data["stats"]
     uptime_str = format_time(st.get("connected_time_seconds"))
@@ -868,15 +1268,10 @@ def print_scan_table(networks: List[Dict[str, Any]], use_color: bool = True) -> 
             ssid = ssid[:22] + "..."
 
         sig = net["signal"]
-        if sig >= 70:
-            sig_col = c_g
-        elif sig >= 40:
-            sig_col = c_y
-        else:
-            sig_col = c_r
-
+        sig_col = c_g if sig >= 70 else (c_y if sig >= 40 else c_r)
         plain_sig = f"{net['bars']} {sig:>3}%"
         sig_meter = f"{sig_col}{plain_sig:<13}{c_reset}"
+
         row = (
             f" {marker}  {ssid:<26} {net['bssid']:<19} {net['channel']:<5} "
             f"{net['freq']:<9} {sig_meter} {net['rate']:<13} {net['security']}"
@@ -885,47 +1280,101 @@ def print_scan_table(networks: List[Dict[str, Any]], use_color: bool = True) -> 
     print()
 
 
-def run_watch_mode(iface: str, interval: float, use_color: bool = True, run_pings: bool = True) -> None:
-    """Runs a live continuous dashboard update."""
+def run_watch_mode(
+    iface: str,
+    interval: float,
+    use_color: bool = True,
+    run_pings: bool = True,
+    log_file: Optional[str] = None,
+) -> None:
+    """Runs a live continuous dashboard update with rolling sparklines and roaming detector."""
     try:
         prev_rx = None
         prev_tx = None
         prev_time = None
+        prev_bssid = None
+
+        sig_history = deque(maxlen=28)
+        lat_history = deque(maxlen=28)
+        roam_events = deque(maxlen=4)
 
         while True:
             t_now = time.time()
             data = collect_wifi_status(iface, run_pings=run_pings)
 
-            # Clear screen & jump to top-left
+            if log_file:
+                append_csv_log(log_file, data)
+
+            # Detect roaming events
+            cur_bssid = data.get("bssid")
+            cur_dbm = data["signal"].get("level_dbm")
+            if prev_bssid and cur_bssid and cur_bssid != prev_bssid:
+                tm_str = time.strftime("%H:%M:%S")
+                roam_events.append(f"[{tm_str}] Roamed: {prev_bssid} → {cur_bssid} ({cur_dbm} dBm)")
+            prev_bssid = cur_bssid
+
+            # Update histories
+            if cur_dbm is not None:
+                sig_history.append(float(cur_dbm))
+            cur_lat = data["latency"].get("gateway_ms")
+            if cur_lat is not None:
+                lat_history.append(float(cur_lat))
+
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
 
             print_dashboard(data, use_color=use_color)
 
-            # Calculate and display real-time delta bandwidth
+            # Sparklines section
+            c_b = COLOR_BOLD if use_color else ""
+            c_g = COLOR_GREEN if use_color else ""
+            c_c = COLOR_CYAN if use_color else ""
+            c_y = COLOR_YELLOW if use_color else ""
+            c_r = COLOR_RED if use_color else ""
+            c_dim = COLOR_DIM if use_color else ""
+            c_reset = COLOR_RESET if use_color else ""
+
+            print(f"  {c_b}Live Real-Time Trends:{c_reset}")
+            if sig_history:
+                sig_spark = make_sparkline(list(sig_history))
+                min_s = int(min(sig_history))
+                max_s = int(max(sig_history))
+                print(f"    Signal Trend   : [{cur_dbm:>3} dBm] {c_g}{sig_spark}{c_reset}  (Min: {min_s}, Max: {max_s} dBm)")
+
+            if lat_history:
+                lat_spark = make_sparkline(list(lat_history))
+                min_l = min(lat_history)
+                max_l = max(lat_history)
+                avg_l = sum(lat_history) / len(lat_history)
+                jitter = (max_l - min_l) / 2.0
+                print(f"    Gateway Jitter : [{cur_lat:>4.1f} ms] {c_c}{lat_spark}{c_reset}  (Avg: {avg_l:.1f}ms, Jitter: ±{jitter:.1f}ms)")
+
+            # Delta Bandwidth Rate
             cur_rx = data["stats"].get("rx_bytes")
             cur_tx = data["stats"].get("tx_bytes")
             if prev_rx is not None and cur_rx is not None and prev_time is not None:
                 dt = max(0.1, t_now - prev_time)
                 rx_rate = (cur_rx - prev_rx) / dt
                 tx_rate = (cur_tx - prev_tx) / dt
-                c_b = COLOR_BOLD if use_color else ""
-                c_g = COLOR_GREEN if use_color else ""
-                c_c = COLOR_CYAN if use_color else ""
-                c_reset = COLOR_RESET if use_color else ""
                 print(
-                    f"  {c_b}Live Transfer Rate:{c_reset} "
-                    f"↓ {c_g}{format_bytes(int(rx_rate))}/s{c_reset}  "
+                    f"    Transfer Rate  : ↓ {c_g}{format_bytes(int(rx_rate))}/s{c_reset}   "
                     f"↑ {c_c}{format_bytes(int(tx_rate))}/s{c_reset}"
                 )
+
+            # Roam Event History
+            if roam_events:
+                print(f"\n  {c_y}{c_b}Recent Roam Events:{c_reset}")
+                for evt in roam_events:
+                    print(f"    🔄 {c_y}{evt}{c_reset}")
+
+            if log_file:
+                print(f"    📁 {c_dim}Site survey logging active -> {log_file}{c_reset}")
 
             prev_rx = cur_rx
             prev_tx = cur_tx
             prev_time = t_now
 
-            c_dim = COLOR_DIM if use_color else ""
-            c_reset = COLOR_RESET if use_color else ""
-            print(f"  {c_dim}Live monitor active (Ctrl+C to quit). Refreshing every {interval:.1f}s...{c_reset}")
+            print(f"\n  {c_dim}Live monitor active (Ctrl+C to quit). Refreshing every {interval:.1f}s...{c_reset}")
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nExiting live monitor.")
@@ -933,18 +1382,21 @@ def run_watch_mode(iface: str, interval: float, use_color: bool = True, run_ping
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wi-Fi Diagnostic & Status tool - displays detailed SSID, frequency, signal strength, bitrate, throughput, and IP metrics.",
+        description="Wi-Fi Diagnostic & Status tool - displays detailed SSID, frequency, signal strength, bitrate, throughput, channel advisor, and mesh roaming.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  wifi-diag                 # Show full Wi-Fi status dashboard
-  wifi-diag -w              # Live monitor mode (updates every 1s)
-  wifi-diag -w 2            # Live monitor with 2s refresh interval
-  wifi-diag -s              # Scan nearby Wi-Fi networks
-  wifi-diag -j              # Output in JSON format
-  wifi-diag -1              # One-line summary (for polybar, waybar, tmux)
-  wifi-diag -i wlan0        # Target specific wireless interface
-  wifi-diag --no-ping       # Skip ping checks for instant output
+  wifi-diag                     # Full Wi-Fi status dashboard & health score
+  wifi-diag -w                  # Live monitor mode with sparklines and roam detector
+  wifi-diag -w 2 --log walk.csv # Live monitor with site-survey walk-test CSV logger
+  wifi-diag -c                  # Channel congestion & interference advisor
+  wifi-diag -m                  # Mesh & multi-AP node inspection for current SSID
+  wifi-diag -t                  # Jitter, packet loss, and bufferbloat stress test
+  wifi-diag -s                  # Scan nearby Wi-Fi networks
+  wifi-diag -j                  # Output full diagnostics in JSON format
+  wifi-diag -1                  # One-line summary (for polybar, waybar, tmux)
+  wifi-diag -i wlan0            # Target specific wireless interface
+  wifi-diag --no-ping           # Skip ping checks for instant output
         """,
     )
     parser.add_argument(
@@ -958,7 +1410,27 @@ Examples:
         const=1.0,
         type=float,
         metavar="INTERVAL",
-        help="Continuously monitor and refresh Wi-Fi status (default: 1.0s)",
+        help="Continuously monitor Wi-Fi status with sparklines (default: 1.0s)",
+    )
+    parser.add_argument(
+        "-c", "--channels", "--advisor",
+        action="store_true",
+        help="Display channel congestion analysis and interference recommendations",
+    )
+    parser.add_argument(
+        "-m", "--mesh", "--roam",
+        action="store_true",
+        help="Display all mesh/multi-AP nodes broadcasting current SSID and relative signals",
+    )
+    parser.add_argument(
+        "-t", "--test", "--ping-test",
+        action="store_true",
+        help="Run jitter, packet loss, and stability ping burst test",
+    )
+    parser.add_argument(
+        "--log", "--survey",
+        metavar="CSV_FILE",
+        help="Log diagnostic records to CSV file (ideal for walk-testing / site survey)",
     )
     parser.add_argument(
         "-s", "--scan",
@@ -1000,7 +1472,32 @@ Examples:
         sys.stderr.write("Error: No wireless interface detected on this system.\n")
         sys.exit(1)
 
-    # Scan mode
+    # 1. Jitter Stress Test
+    if args.test:
+        gw = get_ip_info(iface).get("gateway")
+        print_jitter_test(gw, use_color=use_color)
+        return
+
+    # 2. Channel Congestion Advisor
+    if args.channels:
+        data = collect_wifi_status(iface, run_pings=False)
+        cur_band = data["radio"].get("band")
+        cur_chan = data["radio"].get("channel")
+        print_channel_advisor(cur_band, cur_chan, use_color=use_color)
+        return
+
+    # 3. Mesh & Roaming Inspection
+    if args.mesh:
+        data = collect_wifi_status(iface, run_pings=False)
+        ssid = data.get("ssid")
+        bssid = data.get("bssid")
+        if not ssid:
+            print("Error: Not connected to an SSID to inspect mesh nodes.")
+            return
+        print_mesh_table(ssid, bssid, use_color=use_color)
+        return
+
+    # 4. Scan mode
     if args.scan:
         networks = scan_wifi_networks(iface)
         if args.json:
@@ -1009,14 +1506,24 @@ Examples:
             print_scan_table(networks, use_color=use_color)
         return
 
-    # Watch mode
+    # 5. Watch mode
     if args.watch is not None:
         interval = max(0.2, args.watch)
-        run_watch_mode(iface, interval, use_color=use_color, run_pings=not args.no_ping)
+        run_watch_mode(
+            iface,
+            interval,
+            use_color=use_color,
+            run_pings=not args.no_ping,
+            log_file=args.log,
+        )
         return
 
-    # Collect data once
+    # 6. Single Snapshot
     data = collect_wifi_status(iface, run_pings=not args.no_ping)
+
+    if args.log:
+        append_csv_log(args.log, data)
+        print(f"Recorded snapshot to {args.log}")
 
     if args.json:
         print(json.dumps(data, indent=2))

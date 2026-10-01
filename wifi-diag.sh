@@ -13,6 +13,12 @@ RED="\033[31m"
 DIM="\033[2m"
 RESET="\033[0m"
 
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    echo "Usage: ./wifi-diag.sh [interface]"
+    echo "Lightweight POSIX/Bash Wi-Fi diagnostic utility."
+    exit 0
+fi
+
 # Auto-detect wireless interface if not provided
 IFACE="${1:-}"
 if [ -z "$IFACE" ]; then
@@ -33,12 +39,14 @@ if [ -z "$IFACE" ]; then
     exit 1
 fi
 
-echo -e "${BOLD}${CYAN}=== Wi-Fi Diagnostic Info (${IFACE}) ===${RESET}"
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║${RESET} Wi-Fi Diagnostic Info (${BOLD}${IFACE}${RESET})${CYAN}                                    ║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════╝${RESET}"
 
 # Check connection status
 LINK_INFO="$(iw dev "$IFACE" link 2>/dev/null || true)"
 if ! echo "$LINK_INFO" | grep -q "Connected to"; then
-    echo -e "${YELLOW}Status:${RESET} ${RED}Disconnected${RESET}"
+    echo -e "\n  ${YELLOW}Status:${RESET} ${RED}Disconnected / Not Associated${RESET}\n"
     exit 0
 fi
 
@@ -103,8 +111,21 @@ if [ -n "$GATEWAY" ]; then
     fi
 fi
 
+# Basic health score
+HEALTH_SCORE=100
+SIG_NUM="$(echo "$SIGNAL" | grep -oE -- '-?[0-9]+' | head -n1 || echo "-100")"
+if [ "$SIG_NUM" -lt -75 ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 20))
+elif [ "$SIG_NUM" -lt -65 ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 10))
+fi
+
+if [ "$BAND" = "2.4 GHz" ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 10))
+fi
+
 # Output
-echo -e "  ${BOLD}Network:${RESET}"
+echo -e "\n  ${BOLD}Network:${RESET}"
 echo -e "    SSID         : ${BOLD}${SSID}${RESET}"
 echo -e "    BSSID        : ${BSSID}"
 echo -e "    Standard     : ${GREEN}${STANDARD}${RESET}"
@@ -124,5 +145,7 @@ echo ""
 echo -e "  ${BOLD}IP & Routing:${RESET}"
 echo -e "    IPv4 Address : ${IPV4:-None}"
 echo -e "    Gateway      : ${GATEWAY:-None} ${GW_PING:+(Latency: $GW_PING)}"
-[ -n "$CONN_TIME" ] && echo -e "    Uptime       : ${CONN_TIME}"
-echo -e "${BOLD}${CYAN}========================================${RESET}"
+[ -n "$CONN_TIME" ] && echo -e "    Connected    : ${CONN_TIME}"
+echo ""
+echo -e "  ${BOLD}Health Score   : ${GREEN}${HEALTH_SCORE}/100${RESET}"
+echo -e "${BOLD}${CYAN}──────────────────────────────────────────────────────────────────${RESET}\n"
