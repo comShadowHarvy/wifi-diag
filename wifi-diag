@@ -1339,7 +1339,8 @@ def run_watch_mode(
                 sig_spark = make_sparkline(list(sig_history))
                 min_s = int(min(sig_history))
                 max_s = int(max(sig_history))
-                print(f"    Signal Trend   : [{cur_dbm:>3} dBm] {c_g}{sig_spark}{c_reset}  (Min: {min_s}, Max: {max_s} dBm)")
+                dbm_label = f"{cur_dbm:>3} dBm" if cur_dbm is not None else "  * dBm"
+                print(f"    Signal Trend   : [{dbm_label}] {c_g}{sig_spark}{c_reset}  (Min: {min_s}, Max: {max_s} dBm)")
 
             if lat_history:
                 lat_spark = make_sparkline(list(lat_history))
@@ -1347,7 +1348,8 @@ def run_watch_mode(
                 max_l = max(lat_history)
                 avg_l = sum(lat_history) / len(lat_history)
                 jitter = (max_l - min_l) / 2.0
-                print(f"    Gateway Jitter : [{cur_lat:>4.1f} ms] {c_c}{lat_spark}{c_reset}  (Avg: {avg_l:.1f}ms, Jitter: ±{jitter:.1f}ms)")
+                lat_label = f"{cur_lat:>5.1f} ms" if cur_lat is not None else " *.* ms"
+                print(f"    Gateway Jitter : [{lat_label}] {c_c}{lat_spark}{c_reset}  (Avg: {avg_l:.1f}ms, Jitter: ±{jitter:.1f}ms)")
 
             # Delta Bandwidth Rate
             cur_rx = data["stats"].get("rx_bytes")
